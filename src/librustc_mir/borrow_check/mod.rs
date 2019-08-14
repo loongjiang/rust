@@ -18,7 +18,7 @@ use rustc::mir::{Terminator, TerminatorKind};
 use rustc::ty::query::Providers;
 use rustc::ty::{self, TyCtxt};
 
-use rustc_errors::{Applicability, Diagnostic, DiagnosticBuilder, Level};
+use rustc_errors::{Applicability, Diagnostic, DiagnosticBuilder};
 use rustc_data_structures::bit_set::BitSet;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::graph::dominators::Dominators;
@@ -407,7 +407,8 @@ fn do_mir_borrowck<'a, 'tcx>(
     result
 }
 
-fn downgrade_if_error(diag: &mut Diagnostic) {
+fn downgrade_if_error(_diag: &mut Diagnostic) {
+    /*
     if diag.is_error() {
         diag.level = Level::Warning;
         diag.warn(
@@ -420,6 +421,7 @@ fn downgrade_if_error(diag: &mut Diagnostic) {
             "for more information, try `rustc --explain E0729`"
         );
     }
+    */
 }
 
 crate struct MirBorrowckCtxt<'cx, 'tcx> {
