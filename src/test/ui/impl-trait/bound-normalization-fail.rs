@@ -2,13 +2,11 @@
 // ignore-tidy-linelength
 // edition:2018
 
-#![feature(async_await)]
 #![feature(impl_trait_in_bindings)]
 //~^ WARNING the feature `impl_trait_in_bindings` is incomplete
 
 // See issue 60414
 
-/////////////////////////////////////////////
 // Reduction to `impl Trait`
 
 struct Foo<T>(T);
@@ -33,7 +31,6 @@ mod impl_trait {
     }
 }
 
-/////////////////////////////////////////////
 // Same with lifetimes in the trait
 
 mod lifetimes {

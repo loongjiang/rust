@@ -67,12 +67,12 @@ use syntax::errors;
 use syntax::ext::base::SpecialDerives;
 use syntax::ext::hygiene::ExpnId;
 use syntax::print::pprust;
-use syntax::source_map::{respan, ExpnInfo, ExpnKind, DesugaringKind, Spanned};
+use syntax::source_map::{respan, ExpnData, ExpnKind, DesugaringKind, Spanned};
 use syntax::symbol::{kw, sym, Symbol};
 use syntax::tokenstream::{TokenStream, TokenTree};
 use syntax::parse::token::{self, Token};
 use syntax::visit::{self, Visitor};
-use syntax_pos::{DUMMY_SP, Span};
+use syntax_pos::Span;
 
 const HIR_ID_COUNTER_LOCKED: u32 = 0xFFFFFFFF;
 
@@ -322,7 +322,7 @@ enum ParenthesizedGenericArgs {
 /// `resolve_lifetime` module. Often we "fallthrough" to that code by generating
 /// an "elided" or "underscore" lifetime name. In the future, we probably want to move
 /// everything into HIR lowering.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 enum AnonymousLifetimeMode {
     /// For **Modern** cases, create a new anonymous region parameter
     /// and reference that.
@@ -704,10 +704,9 @@ impl<'a> LoweringContext<'a> {
         span: Span,
         allow_internal_unstable: Option<Lrc<[Symbol]>>,
     ) -> Span {
-        span.fresh_expansion(ExpnId::root(), ExpnInfo {
-            def_site: span,
+        span.fresh_expansion(ExpnData {
             allow_internal_unstable,
-            ..ExpnInfo::default(ExpnKind::Desugaring(reason), span, self.sess.edition())
+            ..ExpnData::default(ExpnKind::Desugaring(reason), span, self.sess.edition())
         })
     }
 
@@ -716,10 +715,16 @@ impl<'a> LoweringContext<'a> {
         anonymous_lifetime_mode: AnonymousLifetimeMode,
         op: impl FnOnce(&mut Self) -> R,
     ) -> R {
+        debug!(
+            "with_anonymous_lifetime_mode(anonymous_lifetime_mode={:?})",
+            anonymous_lifetime_mode,
+        );
         let old_anonymous_lifetime_mode = self.anonymous_lifetime_mode;
         self.anonymous_lifetime_mode = anonymous_lifetime_mode;
         let result = op(self);
         self.anonymous_lifetime_mode = old_anonymous_lifetime_mode;
+        debug!("with_anonymous_lifetime_mode: restoring anonymous_lifetime_mode={:?}",
+               old_anonymous_lifetime_mode);
         result
     }
 
@@ -1034,13 +1039,14 @@ impl<'a> LoweringContext<'a> {
     /// ```
     ///
     /// returns a `hir::TypeBinding` representing `Item`.
-    fn lower_assoc_ty_constraint(&mut self,
-                                 c: &AssocTyConstraint,
-                                 itctx: ImplTraitContext<'_>)
-                                 -> hir::TypeBinding {
-        debug!("lower_assoc_ty_constraint(constraint={:?}, itctx={:?})", c, itctx);
+    fn lower_assoc_ty_constraint(
+        &mut self,
+        constraint: &AssocTyConstraint,
+        itctx: ImplTraitContext<'_>,
+    ) -> hir::TypeBinding {
+        debug!("lower_assoc_ty_constraint(constraint={:?}, itctx={:?})", constraint, itctx);
 
-        let kind = match c.kind {
+        let kind = match constraint.kind {
             AssocTyConstraintKind::Equality { ref ty } => hir::TypeBindingKind::Equality {
                 ty: self.lower_ty(ty, itctx)
             },
@@ -1095,7 +1101,7 @@ impl<'a> LoweringContext<'a> {
                         impl_trait_node_id,
                         DefPathData::ImplTrait,
                         ExpnId::root(),
-                        DUMMY_SP
+                        constraint.span,
                     );
 
                     self.with_dyn_type_scope(false, |this| {
@@ -1103,7 +1109,7 @@ impl<'a> LoweringContext<'a> {
                             &Ty {
                                 id: this.sess.next_node_id(),
                                 node: TyKind::ImplTrait(impl_trait_node_id, bounds.clone()),
-                                span: DUMMY_SP,
+                                span: constraint.span,
                             },
                             itctx,
                         );
@@ -1125,10 +1131,10 @@ impl<'a> LoweringContext<'a> {
         };
 
         hir::TypeBinding {
-            hir_id: self.lower_node_id(c.id),
-            ident: c.ident,
+            hir_id: self.lower_node_id(constraint.id),
+            ident: constraint.ident,
             kind,
-            span: c.span,
+            span: constraint.span,
         }
     }
 
@@ -1224,7 +1230,7 @@ impl<'a> LoweringContext<'a> {
                     P(hir::Path {
                         res,
                         segments: hir_vec![hir::PathSegment::from_ident(
-                            Ident::with_empty_ctxt(kw::SelfUpper)
+                            Ident::with_dummy_span(kw::SelfUpper)
                         )],
                         span: t.span,
                     }),
@@ -1356,6 +1362,13 @@ impl<'a> LoweringContext<'a> {
         opaque_ty_node_id: NodeId,
         lower_bounds: impl FnOnce(&mut LoweringContext<'_>) -> hir::GenericBounds,
     ) -> hir::TyKind {
+        debug!(
+            "lower_opaque_impl_trait(fn_def_id={:?}, opaque_ty_node_id={:?}, span={:?})",
+            fn_def_id,
+            opaque_ty_node_id,
+            span,
+        );
+
         // Make sure we know that some funky desugaring has been going on here.
         // This is a first: there is code in other places like for loop
         // desugaring that explicitly states that we don't want to track that.
@@ -1383,6 +1396,14 @@ impl<'a> LoweringContext<'a> {
             &hir_bounds,
         );
 
+        debug!(
+            "lower_opaque_impl_trait: lifetimes={:#?}", lifetimes,
+        );
+
+        debug!(
+            "lower_opaque_impl_trait: lifetime_defs={:#?}", lifetime_defs,
+        );
+
         self.with_hir_id_owner(opaque_ty_node_id, |lctx| {
             let opaque_ty_item = hir::OpaqueTy {
                 generics: hir::Generics {
@@ -1398,7 +1419,7 @@ impl<'a> LoweringContext<'a> {
                 origin: hir::OpaqueTyOrigin::FnReturn,
             };
 
-            trace!("exist ty from impl trait def-index: {:#?}", opaque_ty_def_index);
+            trace!("lower_opaque_impl_trait: {:#?}", opaque_ty_def_index);
             let opaque_ty_id = lctx.generate_opaque_type(
                 opaque_ty_node_id,
                 opaque_ty_item,
@@ -1446,6 +1467,13 @@ impl<'a> LoweringContext<'a> {
         parent_index: DefIndex,
         bounds: &hir::GenericBounds,
     ) -> (HirVec<hir::GenericArg>, HirVec<hir::GenericParam>) {
+        debug!(
+            "lifetimes_from_impl_trait_bounds(opaque_ty_id={:?}, \
+             parent_index={:?}, \
+             bounds={:#?})",
+            opaque_ty_id, parent_index, bounds,
+        );
+
         // This visitor walks over `impl Trait` bounds and creates defs for all lifetimes that
         // appear in the bounds, excluding lifetimes that are created within the bounds.
         // E.g., `'a`, `'b`, but not `'c` in `impl for<'c> SomeTrait<'a, 'b, 'c>`.
@@ -1533,6 +1561,11 @@ impl<'a> LoweringContext<'a> {
                         }
                     }
                     hir::LifetimeName::Param(_) => lifetime.name,
+
+                    // Refers to some other lifetime that is "in
+                    // scope" within the type.
+                    hir::LifetimeName::ImplicitObjectLifetimeDefault => return,
+
                     hir::LifetimeName::Error | hir::LifetimeName::Static => return,
                 };
 
@@ -1558,7 +1591,7 @@ impl<'a> LoweringContext<'a> {
 
                     let (name, kind) = match name {
                         hir::LifetimeName::Underscore => (
-                            hir::ParamName::Plain(Ident::with_empty_ctxt(kw::UnderscoreLifetime)),
+                            hir::ParamName::Plain(Ident::with_dummy_span(kw::UnderscoreLifetime)),
                             hir::LifetimeParamKind::Elided,
                         ),
                         hir::LifetimeName::Param(param_name) => (
@@ -2002,7 +2035,7 @@ impl<'a> LoweringContext<'a> {
                         bindings: hir_vec![
                             hir::TypeBinding {
                                 hir_id: this.next_id(),
-                                ident: Ident::with_empty_ctxt(FN_OUTPUT_NAME),
+                                ident: Ident::with_dummy_span(FN_OUTPUT_NAME),
                                 kind: hir::TypeBindingKind::Equality {
                                     ty: output
                                         .as_ref()
@@ -2183,6 +2216,14 @@ impl<'a> LoweringContext<'a> {
         fn_def_id: DefId,
         opaque_ty_node_id: NodeId,
     ) -> hir::FunctionRetTy {
+        debug!(
+            "lower_async_fn_ret_ty(\
+             output={:?}, \
+             fn_def_id={:?}, \
+             opaque_ty_node_id={:?})",
+            output, fn_def_id, opaque_ty_node_id,
+        );
+
         let span = output.span();
 
         let opaque_ty_span = self.mark_span_with_reason(
@@ -2264,6 +2305,8 @@ impl<'a> LoweringContext<'a> {
                     span,
                 ),
             );
+
+            debug!("lower_async_fn_ret_ty: future_bound={:#?}", future_bound);
 
             // Calculate all the lifetimes that should be captured
             // by the opaque type. This should include all in-scope
@@ -2394,7 +2437,7 @@ impl<'a> LoweringContext<'a> {
         let future_params = P(hir::GenericArgs {
             args: hir_vec![],
             bindings: hir_vec![hir::TypeBinding {
-                ident: Ident::with_empty_ctxt(FN_OUTPUT_NAME),
+                ident: Ident::with_dummy_span(FN_OUTPUT_NAME),
                 kind: hir::TypeBindingKind::Equality {
                     ty: output_ty,
                 },
@@ -2513,6 +2556,12 @@ impl<'a> LoweringContext<'a> {
                     hir::LifetimeName::Implicit
                         | hir::LifetimeName::Underscore
                         | hir::LifetimeName::Static => hir::ParamName::Plain(lt.name.ident()),
+                    hir::LifetimeName::ImplicitObjectLifetimeDefault => {
+                        span_bug!(
+                            param.ident.span,
+                            "object-lifetime-default should not occur here",
+                        );
+                    }
                     hir::LifetimeName::Error => ParamName::Error,
                 };
 
@@ -2525,15 +2574,6 @@ impl<'a> LoweringContext<'a> {
                 (param_name, kind)
             }
             GenericParamKind::Type { ref default, .. } => {
-                // Don't expose `Self` (recovered "keyword used as ident" parse error).
-                // `rustc::ty` expects `Self` to be only used for a trait's `Self`.
-                // Instead, use `gensym("Self")` to create a distinct name that looks the same.
-                let ident = if param.ident.name == kw::SelfUpper {
-                    param.ident.gensym()
-                } else {
-                    param.ident
-                };
-
                 let add_bounds = add_bounds.get(&param.id).map_or(&[][..], |x| &x);
                 if !add_bounds.is_empty() {
                     let params = self.lower_param_bounds(add_bounds, itctx.reborrow()).into_iter();
@@ -2552,7 +2592,7 @@ impl<'a> LoweringContext<'a> {
                                           .next(),
                 };
 
-                (hir::ParamName::Plain(ident), kind)
+                (hir::ParamName::Plain(param.ident), kind)
             }
             GenericParamKind::Const { ref ty } => {
                 (hir::ParamName::Plain(param.ident), hir::GenericParamKind::Const {
@@ -2669,6 +2709,9 @@ impl<'a> LoweringContext<'a> {
                 );
                 let (pats, ddpos) = self.lower_pat_tuple(pats, "tuple struct");
                 hir::PatKind::TupleStruct(qpath, pats, ddpos)
+            }
+            PatKind::Or(ref pats) => {
+                hir::PatKind::Or(pats.iter().map(|x| self.lower_pat(x)).collect())
             }
             PatKind::Path(ref qself, ref path) => {
                 let qpath = self.lower_qpath(
@@ -3262,7 +3305,13 @@ impl<'a> LoweringContext<'a> {
             AnonymousLifetimeMode::PassThrough => {}
         }
 
-        self.new_implicit_lifetime(span)
+        let r = hir::Lifetime {
+            hir_id: self.next_id(),
+            span,
+            name: hir::LifetimeName::ImplicitObjectLifetimeDefault,
+        };
+        debug!("elided_dyn_bound: r={:?}", r);
+        r
     }
 
     fn new_implicit_lifetime(&mut self, span: Span) -> hir::Lifetime {

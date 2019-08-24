@@ -5,7 +5,7 @@ use crate::source_map::respan;
 use crate::config::StripUnconfigured;
 use crate::ext::base::*;
 use crate::ext::proc_macro::collect_derives;
-use crate::ext::hygiene::{ExpnId, SyntaxContext, ExpnInfo, ExpnKind};
+use crate::ext::hygiene::{ExpnId, SyntaxContext, ExpnData, ExpnKind};
 use crate::ext::tt::macro_rules::annotate_err_with_kind;
 use crate::ext::placeholders::{placeholder, PlaceholderExpander};
 use crate::feature_gate::{self, Features, GateIssue, is_builtin_attr, emit_feature_err};
@@ -25,7 +25,6 @@ use syntax_pos::{Span, DUMMY_SP, FileName};
 
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sync::Lrc;
-use std::fs;
 use std::io::ErrorKind;
 use std::{iter, mem};
 use std::ops::DerefMut;
@@ -292,7 +291,7 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
         // Unresolved macros produce dummy outputs as a recovery measure.
         invocations.reverse();
         let mut expanded_fragments = Vec::new();
-        let mut derives: FxHashMap<ExpnId, Vec<_>> = FxHashMap::default();
+        let mut all_derive_placeholders: FxHashMap<ExpnId, Vec<_>> = FxHashMap::default();
         let mut undetermined_invocations = Vec::new();
         let (mut progress, mut force) = (false, !self.monotonic);
         loop {
@@ -306,9 +305,11 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                 continue
             };
 
-            let scope =
+            let eager_expansion_root =
                 if self.monotonic { invoc.expansion_data.id } else { orig_expansion_data.id };
-            let ext = match self.cx.resolver.resolve_macro_invocation(&invoc, scope, force) {
+            let ext = match self.cx.resolver.resolve_macro_invocation(
+                &invoc, eager_expansion_root, force
+            ) {
                 Ok(ext) => ext,
                 Err(Indeterminate) => {
                     undetermined_invocations.push(invoc);
@@ -319,7 +320,6 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
             progress = true;
             let ExpansionData { depth, id: expn_id, .. } = invoc.expansion_data;
             self.cx.current_expansion = invoc.expansion_data.clone();
-            self.cx.current_expansion.id = scope;
 
             // FIXME(jseyfried): Refactor out the following logic
             let (expanded_fragment, new_invocations) = if let Some(ext) = ext {
@@ -348,13 +348,14 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
 
                 let mut item = self.fully_configure(item);
                 item.visit_attrs(|attrs| attrs.retain(|a| a.path != sym::derive));
-                let derives = derives.entry(invoc.expansion_data.id).or_default();
+                let derive_placeholders =
+                    all_derive_placeholders.entry(invoc.expansion_data.id).or_default();
 
-                derives.reserve(traits.len());
+                derive_placeholders.reserve(traits.len());
                 invocations.reserve(traits.len());
                 for path in traits {
-                    let expn_id = ExpnId::fresh(self.cx.current_expansion.id, None);
-                    derives.push(expn_id);
+                    let expn_id = ExpnId::fresh(None);
+                    derive_placeholders.push(NodeId::placeholder_from_expn_id(expn_id));
                     invocations.push(Invocation {
                         kind: InvocationKind::Derive { path, item: item.clone() },
                         fragment_kind: invoc.fragment_kind,
@@ -366,7 +367,7 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
                 }
                 let fragment = invoc.fragment_kind
                     .expect_from_annotatables(::std::iter::once(item));
-                self.collect_invocations(fragment, derives)
+                self.collect_invocations(fragment, derive_placeholders)
             } else {
                 unreachable!()
             };
@@ -385,10 +386,11 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
         // Finally incorporate all the expanded macros into the input AST fragment.
         let mut placeholder_expander = PlaceholderExpander::new(self.cx, self.monotonic);
         while let Some(expanded_fragments) = expanded_fragments.pop() {
-            for (mark, expanded_fragment) in expanded_fragments.into_iter().rev() {
-                let derives = derives.remove(&mark).unwrap_or_else(Vec::new);
-                placeholder_expander.add(NodeId::placeholder_from_expn_id(mark),
-                                         expanded_fragment, derives);
+            for (expn_id, expanded_fragment) in expanded_fragments.into_iter().rev() {
+                let derive_placeholders =
+                    all_derive_placeholders.remove(&expn_id).unwrap_or_else(Vec::new);
+                placeholder_expander.add(NodeId::placeholder_from_expn_id(expn_id),
+                                         expanded_fragment, derive_placeholders);
             }
         }
         fragment_with_placeholders.mut_visit_with(&mut placeholder_expander);
@@ -405,7 +407,7 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
     /// them with "placeholders" - dummy macro invocations with specially crafted `NodeId`s.
     /// Then call into resolver that builds a skeleton ("reduced graph") of the fragment and
     /// prepares data for resolving paths of macro invocations.
-    fn collect_invocations(&mut self, mut fragment: AstFragment, derives: &[ExpnId])
+    fn collect_invocations(&mut self, mut fragment: AstFragment, extra_placeholders: &[NodeId])
                            -> (AstFragment, Vec<Invocation>) {
         // Resolve `$crate`s in the fragment for pretty-printing.
         self.cx.resolver.resolve_dollar_crates();
@@ -424,9 +426,10 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
             collector.invocations
         };
 
+        // FIXME: Merge `extra_placeholders` into the `fragment` as regular placeholders.
         if self.monotonic {
             self.cx.resolver.visit_ast_fragment_with_placeholders(
-                self.cx.current_expansion.id, &fragment, derives);
+                self.cx.current_expansion.id, &fragment, extra_placeholders);
         }
 
         (fragment, invocations)
@@ -475,11 +478,11 @@ impl<'a, 'b> MacroExpander<'a, 'b> {
         }
 
         if self.cx.current_expansion.depth > self.cx.ecfg.recursion_limit {
-            let info = self.cx.current_expansion.id.expn_info().unwrap();
+            let expn_data = self.cx.current_expansion.id.expn_data();
             let suggested_limit = self.cx.ecfg.recursion_limit * 2;
-            let mut err = self.cx.struct_span_err(info.call_site,
+            let mut err = self.cx.struct_span_err(expn_data.call_site,
                 &format!("recursion limit reached while expanding the macro `{}`",
-                         info.kind.descr()));
+                         expn_data.kind.descr()));
             err.help(&format!(
                 "consider adding a `#![recursion_limit=\"{}\"]` attribute to your crate",
                 suggested_limit));
@@ -759,7 +762,7 @@ impl<'a> Parser<'a> {
             let msg = format!("macro expansion ignores token `{}` and any following",
                               self.this_token_to_string());
             // Avoid emitting backtrace info twice.
-            let def_site_span = self.token.span.with_ctxt(SyntaxContext::empty());
+            let def_site_span = self.token.span.with_ctxt(SyntaxContext::root());
             let mut err = self.diagnostic().struct_span_err(def_site_span, &msg);
             err.span_label(span, "caused by the macro expansion here");
             let msg = format!(
@@ -796,17 +799,20 @@ struct InvocationCollector<'a, 'b> {
 
 impl<'a, 'b> InvocationCollector<'a, 'b> {
     fn collect(&mut self, fragment_kind: AstFragmentKind, kind: InvocationKind) -> AstFragment {
-        // Expansion info for all the collected invocations is set upon their resolution,
+        // Expansion data for all the collected invocations is set upon their resolution,
         // with exception of the derive container case which is not resolved and can get
-        // its expansion info immediately.
-        let expn_info = match &kind {
-            InvocationKind::DeriveContainer { item, .. } => Some(ExpnInfo::default(
-                ExpnKind::Macro(MacroKind::Attr, sym::derive),
-                item.span(), self.cx.parse_sess.edition,
-            )),
+        // its expansion data immediately.
+        let expn_data = match &kind {
+            InvocationKind::DeriveContainer { item, .. } => Some(ExpnData {
+                parent: self.cx.current_expansion.id,
+                ..ExpnData::default(
+                    ExpnKind::Macro(MacroKind::Attr, sym::derive),
+                    item.span(), self.cx.parse_sess.edition,
+                )
+            }),
             _ => None,
         };
-        let expn_id = ExpnId::fresh(self.cx.current_expansion.id, expn_info);
+        let expn_id = ExpnId::fresh(expn_data);
         self.invocations.push(Invocation {
             kind,
             fragment_kind,
@@ -1238,32 +1244,30 @@ impl<'a, 'b> MutVisitor for InvocationCollector<'a, 'b> {
                     }
 
                     let filename = self.cx.resolve_path(&*file.as_str(), it.span());
-                    match fs::read_to_string(&filename) {
-                        Ok(src) => {
-                            let src_interned = Symbol::intern(&src);
-
-                            // Add this input file to the code map to make it available as
-                            // dependency information
-                            self.cx.source_map().new_source_file(filename.into(), src);
+                    match self.cx.source_map().load_file(&filename) {
+                        Ok(source_file) => {
+                            let src = source_file.src.as_ref()
+                                .expect("freshly loaded file should have a source");
+                            let src_interned = Symbol::intern(src.as_str());
 
                             let include_info = vec![
                                 ast::NestedMetaItem::MetaItem(
                                     attr::mk_name_value_item_str(
-                                        Ident::with_empty_ctxt(sym::file),
+                                        Ident::with_dummy_span(sym::file),
                                         file,
                                         DUMMY_SP,
                                     ),
                                 ),
                                 ast::NestedMetaItem::MetaItem(
                                     attr::mk_name_value_item_str(
-                                        Ident::with_empty_ctxt(sym::contents),
+                                        Ident::with_dummy_span(sym::contents),
                                         src_interned,
                                         DUMMY_SP,
                                     ),
                                 ),
                             ];
 
-                            let include_ident = Ident::with_empty_ctxt(sym::include);
+                            let include_ident = Ident::with_dummy_span(sym::include);
                             let item = attr::mk_list_item(include_ident, include_info);
                             items.push(ast::NestedMetaItem::MetaItem(item));
                         }
@@ -1325,7 +1329,7 @@ impl<'a, 'b> MutVisitor for InvocationCollector<'a, 'b> {
                 }
             }
 
-            let meta = attr::mk_list_item(Ident::with_empty_ctxt(sym::doc), items);
+            let meta = attr::mk_list_item(Ident::with_dummy_span(sym::doc), items);
             *at = attr::Attribute {
                 span: at.span,
                 id: at.id,

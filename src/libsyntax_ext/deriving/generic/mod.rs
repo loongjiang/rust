@@ -425,7 +425,7 @@ impl<'a> TraitDef<'a> {
                         return;
                     }
                 };
-                let container_id = cx.current_expansion.id.parent();
+                let container_id = cx.current_expansion.id.expn_data().parent;
                 let is_always_copy =
                     cx.resolver.has_derives(container_id, SpecialDerives::COPY) &&
                     has_no_type_params;
@@ -890,7 +890,7 @@ impl<'a> MethodDef<'a> {
 
         for (ty, name) in self.args.iter() {
             let ast_ty = ty.to_ty(cx, trait_.span, type_ident, generics);
-            let ident = cx.ident_of(name).gensym();
+            let ident = ast::Ident::from_str_and_span(name, trait_.span);
             arg_tys.push((ident, ast_ty));
 
             let arg_expr = cx.expr_ident(trait_.span, ident);
@@ -928,7 +928,7 @@ impl<'a> MethodDef<'a> {
 
         let args = {
             let self_args = explicit_self.map(|explicit_self| {
-                let ident = Ident::with_empty_ctxt(kw::SelfLower).with_span_pos(trait_.span);
+                let ident = Ident::with_dummy_span(kw::SelfLower).with_span_pos(trait_.span);
                 ast::Arg::from_self(ThinVec::default(), explicit_self, ident)
             });
             let nonself_args = arg_types.into_iter()
@@ -1210,7 +1210,7 @@ impl<'a> MethodDef<'a> {
         let vi_idents = self_arg_names.iter()
             .map(|name| {
                 let vi_suffix = format!("{}_vi", &name[..]);
-                cx.ident_of(&vi_suffix[..]).gensym()
+                ast::Ident::from_str_and_span(&vi_suffix[..], trait_.span)
             })
             .collect::<Vec<ast::Ident>>();
 
@@ -1387,7 +1387,10 @@ impl<'a> MethodDef<'a> {
                 let variant_value =
                     deriving::call_intrinsic(cx, sp, "discriminant_value", vec![self_addr]);
 
-                let target_ty = cx.ty_ident(sp, cx.ident_of(target_type_name));
+                let target_ty = cx.ty_ident(
+                    sp,
+                    ast::Ident::from_str_and_span(target_type_name, sp),
+                );
                 let variant_disr = cx.expr_cast(sp, variant_value, target_ty);
                 let let_stmt = cx.stmt_let(sp, false, ident, variant_disr);
                 index_let_stmts.push(let_stmt);
@@ -1588,7 +1591,7 @@ impl<'a> TraitDef<'a> {
         let mut ident_exprs = Vec::new();
         for (i, struct_field) in struct_def.fields().iter().enumerate() {
             let sp = struct_field.span.with_ctxt(self.span.ctxt());
-            let ident = cx.ident_of(&format!("{}_{}", prefix, i)).gensym();
+            let ident = ast::Ident::from_str_and_span(&format!("{}_{}", prefix, i), self.span);
             paths.push(ident.with_span_pos(sp));
             let val = cx.expr_path(cx.path_ident(sp, ident));
             let val = if use_temporaries {

@@ -37,7 +37,7 @@ fn main() {
             let mut new = None;
             if let Some(current_as_str) = args[i].to_str() {
                 if (&*args[i - 1] == "-C" && current_as_str.starts_with("metadata")) ||
-                   current_as_str.starts_with("-Cmetadata") {
+                    current_as_str.starts_with("-Cmetadata") {
                     new = Some(format!("{}-{}", current_as_str, s));
                 }
             }
@@ -89,7 +89,7 @@ fn main() {
     if let Some(crate_name) = crate_name {
         if let Some(target) = env::var_os("RUSTC_TIME") {
             if target == "all" ||
-               target.into_string().unwrap().split(",").any(|c| c.trim() == crate_name)
+                target.into_string().unwrap().split(",").any(|c| c.trim() == crate_name)
             {
                 cmd.arg("-Ztime");
             }
@@ -102,8 +102,13 @@ fn main() {
     // FIXME: the fact that core here is excluded is due to core_arch from our stdarch submodule
     // being broken on the beta compiler with bootstrap passed, so this is a temporary workaround
     // (we've just snapped, so there are no cfg(bootstrap) related annotations in core).
-    if stage == "0" && crate_name != Some("core") {
-        cmd.arg("--cfg").arg("bootstrap");
+    if stage == "0" {
+        if crate_name != Some("core") {
+            cmd.arg("--cfg").arg("bootstrap");
+        } else {
+            // NOTE(eddyb) see FIXME above, except now we need annotations again in core.
+            cmd.arg("--cfg").arg("boostrap_stdarch_ignore_this");
+        }
     }
 
     // Print backtrace in case of ICE
@@ -276,10 +281,6 @@ fn main() {
                 cmd.arg("-C").arg("target-feature=-crt-static");
             }
         }
-
-        if let Ok(map) = env::var("RUSTC_DEBUGINFO_MAP") {
-            cmd.arg("--remap-path-prefix").arg(&map);
-        }
     } else {
         // Override linker if necessary.
         if let Ok(host_linker) = env::var("RUSTC_HOST_LINKER") {
@@ -294,6 +295,10 @@ fn main() {
                 cmd.arg("-C").arg("target-feature=-crt-static");
             }
         }
+    }
+
+    if let Ok(map) = env::var("RUSTC_DEBUGINFO_MAP") {
+        cmd.arg("--remap-path-prefix").arg(&map);
     }
 
     // Force all crates compiled by this compiler to (a) be unstable and (b)

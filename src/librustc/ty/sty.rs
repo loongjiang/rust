@@ -1141,13 +1141,6 @@ impl<'tcx> ParamTy {
     pub fn to_ty(self, tcx: TyCtxt<'tcx>) -> Ty<'tcx> {
         tcx.mk_ty_param(self.index, self.name)
     }
-
-    pub fn is_self(&self) -> bool {
-        // FIXME(#50125): Ignoring `Self` with `index != 0` might lead to weird behavior elsewhere,
-        // but this should only be possible when using `-Z continue-parse-after-error` like
-        // `compile-fail/issue-36638.rs`.
-        self.name.as_symbol() == kw::SelfUpper && self.index == 0
-    }
 }
 
 #[derive(Copy, Clone, Hash, RustcEncodable, RustcDecodable,
@@ -1790,14 +1783,6 @@ impl<'tcx> TyS<'tcx> {
     }
 
     #[inline]
-    pub fn is_self(&self) -> bool {
-        match self.sty {
-            Param(ref p) => p.is_self(),
-            _ => false,
-        }
-    }
-
-    #[inline]
     pub fn is_slice(&self) -> bool {
         match self.sty {
             RawPtr(TypeAndMut { ty, .. }) | Ref(_, ty, _) => match ty.sty {
@@ -2314,23 +2299,33 @@ impl<'tcx> Const<'tcx> {
         assert_eq!(self.ty, ty);
         // if `ty` does not depend on generic parameters, use an empty param_env
         let size = tcx.layout_of(param_env.with_reveal_all().and(ty)).ok()?.size;
+        self.eval(tcx, param_env).val.try_to_bits(size)
+    }
+
+    #[inline]
+    pub fn eval(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        param_env: ParamEnv<'tcx>,
+    ) -> &Const<'tcx> {
+        // FIXME(const_generics): this doesn't work right now,
+        // because it tries to relate an `Infer` to a `Param`.
         match self.val {
-            // FIXME(const_generics): this doesn't work right now,
-            // because it tries to relate an `Infer` to a `Param`.
             ConstValue::Unevaluated(did, substs) => {
                 // if `substs` has no unresolved components, use and empty param_env
                 let (param_env, substs) = param_env.with_reveal_all().and(substs).into_parts();
                 // try to resolve e.g. associated constants to their definition on an impl
-                let instance = ty::Instance::resolve(tcx, param_env, did, substs)?;
+                let instance = match ty::Instance::resolve(tcx, param_env, did, substs) {
+                    Some(instance) => instance,
+                    None => return self,
+                };
                 let gid = GlobalId {
                     instance,
                     promoted: None,
                 };
-                let evaluated = tcx.const_eval(param_env.and(gid)).ok()?;
-                evaluated.val.try_to_bits(size)
+                tcx.const_eval(param_env.and(gid)).unwrap_or(self)
             },
-            // otherwise just extract a `ConstValue`'s bits if possible
-            _ => self.val.try_to_bits(size),
+            _ => self,
         }
     }
 

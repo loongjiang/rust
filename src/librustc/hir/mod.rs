@@ -23,7 +23,6 @@ use rustc_target::spec::abi::Abi;
 use syntax::ast::{self, CrateSugar, Ident, Name, NodeId, AsmDialect};
 use syntax::ast::{Attribute, Label, LitKind, StrStyle, FloatTy, IntTy, UintTy};
 use syntax::attr::{InlineAttr, OptimizeAttr};
-use syntax::ext::hygiene::SyntaxContext;
 use syntax::symbol::{Symbol, kw};
 use syntax::tokenstream::TokenStream;
 use syntax::util::parser::ExprPrecedence;
@@ -202,7 +201,7 @@ impl ParamName {
         match *self {
             ParamName::Plain(ident) => ident,
             ParamName::Fresh(_) |
-            ParamName::Error => Ident::with_empty_ctxt(kw::UnderscoreLifetime),
+            ParamName::Error => Ident::with_dummy_span(kw::UnderscoreLifetime),
         }
     }
 
@@ -222,6 +221,19 @@ pub enum LifetimeName {
     /// User wrote nothing (e.g., the lifetime in `&u32`).
     Implicit,
 
+    /// Implicit lifetime in a context like `dyn Foo`. This is
+    /// distinguished from implicit lifetimes elsewhere because the
+    /// lifetime that they default to must appear elsewhere within the
+    /// enclosing type.  This means that, in an `impl Trait` context, we
+    /// don't have to create a parameter for them. That is, `impl
+    /// Trait<Item = &u32>` expands to an opaque type like `type
+    /// Foo<'a> = impl Trait<Item = &'a u32>`, but `impl Trait<item =
+    /// dyn Bar>` expands to `type Foo = impl Trait<Item = dyn Bar +
+    /// 'static>`. The latter uses `ImplicitObjectLifetimeDefault` so
+    /// that surrounding code knows not to create a lifetime
+    /// parameter.
+    ImplicitObjectLifetimeDefault,
+
     /// Indicates an error during lowering (usually `'_` in wrong place)
     /// that was already reported.
     Error,
@@ -236,16 +248,20 @@ pub enum LifetimeName {
 impl LifetimeName {
     pub fn ident(&self) -> Ident {
         match *self {
-            LifetimeName::Implicit | LifetimeName::Error => Ident::invalid(),
-            LifetimeName::Underscore => Ident::with_empty_ctxt(kw::UnderscoreLifetime),
-            LifetimeName::Static => Ident::with_empty_ctxt(kw::StaticLifetime),
+            LifetimeName::ImplicitObjectLifetimeDefault
+                | LifetimeName::Implicit
+                | LifetimeName::Error => Ident::invalid(),
+            LifetimeName::Underscore => Ident::with_dummy_span(kw::UnderscoreLifetime),
+            LifetimeName::Static => Ident::with_dummy_span(kw::StaticLifetime),
             LifetimeName::Param(param_name) => param_name.ident(),
         }
     }
 
     pub fn is_elided(&self) -> bool {
         match self {
-            LifetimeName::Implicit | LifetimeName::Underscore => true,
+            LifetimeName::ImplicitObjectLifetimeDefault
+            | LifetimeName::Implicit
+            | LifetimeName::Underscore => true,
 
             // It might seem surprising that `Fresh(_)` counts as
             // *not* elided -- but this is because, as far as the code
@@ -882,6 +898,7 @@ impl Pat {
             PatKind::TupleStruct(_, ref s, _) | PatKind::Tuple(ref s, _) => {
                 s.iter().all(|p| p.walk_(it))
             }
+            PatKind::Or(ref pats) => pats.iter().all(|p| p.walk_(it)),
             PatKind::Box(ref s) | PatKind::Ref(ref s, _) => {
                 s.walk_(it)
             }
@@ -975,6 +992,10 @@ pub enum PatKind {
     /// If the `..` pattern fragment is present, then `Option<usize>` denotes its position.
     /// `0 <= position <= subpats.len()`
     TupleStruct(QPath, HirVec<P<Pat>>, Option<usize>),
+
+    /// An or-pattern `A | B | C`.
+    /// Invariant: `pats.len() >= 2`.
+    Or(HirVec<P<Pat>>),
 
     /// A path pattern for an unit struct/variant or a (maybe-associated) constant.
     Path(QPath),
@@ -2004,8 +2025,6 @@ pub struct InlineAsm {
     pub volatile: bool,
     pub alignstack: bool,
     pub dialect: AsmDialect,
-    #[stable_hasher(ignore)] // This is used for error reporting
-    pub ctxt: SyntaxContext,
 }
 
 /// Represents an argument in a function header.
@@ -2184,8 +2203,6 @@ pub struct ForeignMod {
 #[derive(RustcEncodable, RustcDecodable, Debug, HashStable)]
 pub struct GlobalAsm {
     pub asm: Symbol,
-    #[stable_hasher(ignore)] // This is used for error reporting
-    pub ctxt: SyntaxContext,
 }
 
 #[derive(RustcEncodable, RustcDecodable, Debug, HashStable)]

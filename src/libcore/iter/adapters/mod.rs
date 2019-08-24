@@ -405,6 +405,36 @@ impl<I> Iterator for Cycle<I> where I: Clone + Iterator {
             _ => (usize::MAX, None)
         }
     }
+
+    #[inline]
+    fn try_fold<Acc, F, R>(&mut self, mut acc: Acc, mut f: F) -> R
+    where
+        F: FnMut(Acc, Self::Item) -> R,
+        R: Try<Ok = Acc>,
+    {
+        // fully iterate the current iterator. this is necessary because
+        // `self.iter` may be empty even when `self.orig` isn't
+        acc = self.iter.try_fold(acc, &mut f)?;
+        self.iter = self.orig.clone();
+
+        // complete a full cycle, keeping track of whether the cycled
+        // iterator is empty or not. we need to return early in case
+        // of an empty iterator to prevent an infinite loop
+        let mut is_empty = true;
+        acc = self.iter.try_fold(acc, |acc, x| {
+            is_empty = false;
+            f(acc, x)
+        })?;
+
+        if is_empty {
+            return Try::from_ok(acc);
+        }
+
+        loop {
+            self.iter = self.orig.clone();
+            acc = self.iter.try_fold(acc, &mut f)?;
+        }
+    }
 }
 
 #[stable(feature = "fused", since = "1.26.0")]
@@ -1279,7 +1309,7 @@ impl<I> DoubleEndedIterator for Peekable<I> where I: DoubleEndedIterator {
         Self: Sized, F: FnMut(B, Self::Item) -> R, R: Try<Ok=B>
     {
         match self.peeked.take() {
-            Some(None) => return Try::from_ok(init),
+            Some(None) => Try::from_ok(init),
             Some(Some(v)) => match self.iter.try_rfold(init, &mut f).into_result() {
                 Ok(acc) => f(acc, v),
                 Err(e) => {
@@ -1296,7 +1326,7 @@ impl<I> DoubleEndedIterator for Peekable<I> where I: DoubleEndedIterator {
         where Fold: FnMut(Acc, Self::Item) -> Acc,
     {
         match self.peeked {
-            Some(None) => return init,
+            Some(None) => init,
             Some(Some(v)) => {
                 let acc = self.iter.rfold(init, &mut fold);
                 fold(acc, v)
